@@ -1,0 +1,315 @@
+#!/bin/bash
+# Установка VLESS + XTLS-Vision + TLS с фолбэком на сайт (HTTP/1.1 и HTTP/2)
+#
+# Перед запуском:
+#   export domain=example.com
+#   bash xray-install.sh
+#
+# ВНИМАНИЕ: повторный запуск на рабочем сервере генерирует новый UUID
+# и перезаписывает config.json — все добавленные клиенты пропадут.
+
+set -u
+
+if [ -z "${domain:-}" ]; then
+    echo "Переменная domain не задана. Выполните: export domain=example.com"
+    exit 1
+fi
+
+XRAY_DIR=/usr/local/etc/xray
+CERT_DIR=$XRAY_DIR/xray_cert
+CONF=$XRAY_DIR/config.json
+
+apt update
+apt install curl wget nginx qrencode jq -y
+
+# ---------- BBR ----------
+if [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ]; then
+    echo "bbr уже включен"
+else
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+    sysctl -p
+    echo "bbr включен"
+fi
+
+# ---------- Ядро Xray ----------
+# Ставим до сертификата: reloadcmd acme.sh перезапускает xray
+bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+# ---------- Nginx ----------
+# :80    — выдача ACME-челленджей + редирект на https
+# :8080  — фолбэк для HTTP/1.1 (h1, без TLS)
+# :8081  — фолбэк для HTTP/2   (h2c, без TLS)
+# proxy_protocol — Xray передаёт реальный IP посетителя (xver: 1)
+cat << EOF > /etc/nginx/sites-available/default
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 127.0.0.1:8080 proxy_protocol;
+    listen 127.0.0.1:8081 http2 proxy_protocol;
+    server_name $domain;
+
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+
+    root /var/www/html;
+    index index.html;
+
+    add_header Strict-Transport-Security "max-age=63072000" always;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+
+[ -f /var/www/html/index.nginx-debian.html ] && mv /var/www/html/index.nginx-debian.html /var/www/html/index.html
+nginx -t && systemctl restart nginx
+
+# ---------- Сертификат ----------
+curl -fsSL https://get.acme.sh | sh
+~/.acme.sh/acme.sh --upgrade --auto-upgrade
+~/.acme.sh/acme.sh --issue --server letsencrypt -d "$domain" -w /var/www/html --keylength ec-256 --force
+
+mkdir -p "$CERT_DIR"
+# acme.sh запоминает пути и reloadcmd и сам повторяет их при каждом продлении (свой cron)
+~/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+    --fullchain-file "$CERT_DIR/xray.crt" \
+    --key-file "$CERT_DIR/xray.key" \
+    --reloadcmd "chown nobody:nogroup $CERT_DIR/xray.key && chmod 600 $CERT_DIR/xray.key && systemctl restart xray"
+
+# ---------- Ключи ----------
+uuid=$(xray uuid)
+cat << EOF > "$XRAY_DIR/.keys"
+uuid: $uuid
+domain: $domain
+EOF
+chmod 600 "$XRAY_DIR/.keys"
+
+# ---------- Конфиг Xray ----------
+cat << EOF > "$CONF"
+{
+    "log": {
+        "loglevel": "warning"
+    },
+    "dns": {
+        "servers": [
+            "https+local://1.1.1.1/dns-query",
+            "localhost"
+        ]
+    },
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "type": "field",
+                "domain": ["geosite:category-ads-all"],
+                "outboundTag": "block"
+            }
+        ]
+    },
+    "inbounds": [
+        {
+            "port": 443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "email": "main",
+                        "id": "$uuid",
+                        "flow": "xtls-rprx-vision",
+                        "level": 0
+                    }
+                ],
+                "decryption": "none",
+                "fallbacks": [
+                    { "dest": 8080, "xver": 1 },
+                    { "alpn": "h2", "dest": 8081, "xver": 1 }
+                ]
+            },
+            "streamSettings": {
+                "network": "raw",
+                "security": "tls",
+                "tlsSettings": {
+                    "alpn": ["h2", "http/1.1"],
+                    "minVersion": "1.2",
+                    "certificates": [
+                        {
+                            "certificateFile": "$CERT_DIR/xray.crt",
+                            "keyFile": "$CERT_DIR/xray.key"
+                        }
+                    ]
+                }
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"],
+                "routeOnly": true
+            }
+        }
+    ],
+    "outbounds": [
+        { "protocol": "freedom",   "tag": "direct" },
+        { "protocol": "blackhole", "tag": "block" }
+    ]
+}
+EOF
+
+# ---------- Хелперы ----------
+
+# Общий генератор ссылки: xray-mklink <uuid> <имя>
+cat << 'EOF' > /usr/local/bin/xray-mklink
+#!/bin/bash
+CONF=/usr/local/etc/xray/config.json
+domain=$(awk -F': ' '/^domain/ {print $2}' /usr/local/etc/xray/.keys)
+port=$(jq -r '.inbounds[0].port' "$CONF")
+link="vless://$1@$domain:$port?type=tcp&security=tls&sni=$domain&alpn=h2%2Chttp%2F1.1&fp=chrome&flow=xtls-rprx-vision&headerType=none&encryption=none#$2"
+echo ""
+echo "Ссылка для подключения:"
+echo "$link"
+echo ""
+echo "QR-код:"
+echo "$link" | qrencode -t ansiutf8
+EOF
+chmod +x /usr/local/bin/xray-mklink
+
+# Безопасное применение нового конфига: проверка перед заменой
+cat << 'EOF' > /usr/local/bin/xray-apply
+#!/bin/bash
+# xray-apply <новый_конфиг>
+CONF=/usr/local/etc/xray/config.json
+if xray run -test -c "$1" > /dev/null 2>&1; then
+    mv "$1" "$CONF" && systemctl restart xray
+else
+    echo "Ошибка в новом конфиге, изменения не применены:"
+    xray run -test -c "$1"
+    rm -f "$1"
+    exit 1
+fi
+EOF
+chmod +x /usr/local/bin/xray-apply
+
+cat << 'EOF' > /usr/local/bin/userlist
+#!/bin/bash
+emails=($(jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json))
+if [[ ${#emails[@]} -eq 0 ]]; then
+    echo "Список клиентов пуст"
+    exit 1
+fi
+echo "Список клиентов:"
+for i in "${!emails[@]}"; do
+    echo "$((i+1)). ${emails[$i]}"
+done
+EOF
+chmod +x /usr/local/bin/userlist
+
+cat << 'EOF' > /usr/local/bin/mainuser
+#!/bin/bash
+uuid=$(awk -F': ' '/^uuid/ {print $2}' /usr/local/etc/xray/.keys)
+xray-mklink "$uuid" "mainuser"
+EOF
+chmod +x /usr/local/bin/mainuser
+
+cat << 'EOF' > /usr/local/bin/newuser
+#!/bin/bash
+CONF=/usr/local/etc/xray/config.json
+read -p "Введите имя пользователя (email): " email
+if [[ -z "$email" || "$email" == *" "* ]]; then
+    echo "Имя пользователя не может быть пустым или содержать пробелы."
+    exit 1
+fi
+if [[ -n "$(jq --arg e "$email" '.inbounds[0].settings.clients[] | select(.email == $e)' "$CONF")" ]]; then
+    echo "Пользователь с таким именем уже существует."
+    exit 1
+fi
+uuid=$(xray uuid)
+tmp=$(mktemp)
+jq --arg e "$email" --arg u "$uuid" \
+   '.inbounds[0].settings.clients += [{"email": $e, "id": $u, "flow": "xtls-rprx-vision", "level": 0}]' \
+   "$CONF" > "$tmp" && xray-apply "$tmp" && xray-mklink "$uuid" "$email"
+EOF
+chmod +x /usr/local/bin/newuser
+
+cat << 'EOF' > /usr/local/bin/rmuser
+#!/bin/bash
+CONF=/usr/local/etc/xray/config.json
+emails=($(jq -r '.inbounds[0].settings.clients[].email' "$CONF"))
+if [[ ${#emails[@]} -eq 0 ]]; then
+    echo "Нет клиентов для удаления."
+    exit 1
+fi
+echo "Список клиентов:"
+for i in "${!emails[@]}"; do
+    echo "$((i+1)). ${emails[$i]}"
+done
+read -p "Введите номер клиента для удаления: " choice
+if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#emails[@]} )); then
+    echo "Ошибка: номер должен быть от 1 до ${#emails[@]}"
+    exit 1
+fi
+selected="${emails[$((choice - 1))]}"
+tmp=$(mktemp)
+jq --arg e "$selected" '(.inbounds[0].settings.clients) |= map(select(.email != $e))' \
+   "$CONF" > "$tmp" && xray-apply "$tmp" && echo "Клиент $selected удалён."
+EOF
+chmod +x /usr/local/bin/rmuser
+
+cat << 'EOF' > /usr/local/bin/sharelink
+#!/bin/bash
+CONF=/usr/local/etc/xray/config.json
+emails=($(jq -r '.inbounds[0].settings.clients[].email' "$CONF"))
+for i in "${!emails[@]}"; do
+    echo "$((i + 1)). ${emails[$i]}"
+done
+read -p "Выберите клиента: " client
+if ! [[ "$client" =~ ^[0-9]+$ ]] || (( client < 1 || client > ${#emails[@]} )); then
+    echo "Ошибка: номер должен быть от 1 до ${#emails[@]}"
+    exit 1
+fi
+selected="${emails[$((client - 1))]}"
+uuid=$(jq -r --arg e "$selected" '.inbounds[0].settings.clients[] | select(.email == $e) | .id' "$CONF")
+xray-mklink "$uuid" "$selected"
+EOF
+chmod +x /usr/local/bin/sharelink
+
+# ---------- Запуск ----------
+if xray run -test -c "$CONF" > /dev/null 2>&1; then
+    systemctl restart xray
+    echo "Xray-core успешно установлен"
+    mainuser
+else
+    echo "Ошибка в конфиге Xray:"
+    xray run -test -c "$CONF"
+    exit 1
+fi
+
+cat << 'EOF' > "$HOME/help"
+
+Команды для управления пользователями Xray:
+
+    mainuser  - ссылка основного пользователя
+    newuser   - создать пользователя
+    rmuser    - удалить пользователя
+    sharelink - выбрать пользователя и вывести его ссылку
+    userlist  - список клиентов
+
+Конфиг Xray:          /usr/local/etc/xray/config.json
+Проверка конфига:     xray run -test -c /usr/local/etc/xray/config.json
+Перезапуск Xray:      systemctl restart xray
+Перезапуск Nginx:     systemctl restart nginx
+Папка сайта:          /var/www/html
+Сертификат продлевает acme.sh автоматически (crontab -l — строка acme.sh)
+
+EOF
