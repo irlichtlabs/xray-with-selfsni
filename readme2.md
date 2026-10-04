@@ -270,3 +270,58 @@ systemctl status xray nginx --no-pager
 - Домен указывает на IP сервера напрямую. При блокировке по IP пропадут и сайт, и VPN. Резервный вариант — дополнительный инбаунд VLESS + XHTTP на отдельном поддомене за CDN.
 - Соединения TCP + Vision к зарубежным хостингам в России могут подвергаться «заморозке» после первых десятков килобайт. Поведение зависит от провайдера и региона.
 - SSH на том же IP делает сервер заметнее для сканеров. Ограничьте SSH по IP или пускайте его через туннель.
+
+## Команда для обновления ядра
+```sh
+bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+```
+
+## Полезные ссылки
+
+- [GitHub проекта X-ray Core](https://github.com/XTLS/Xray-core)
+- [Официальная документация на русском](https://xtls.github.io/ru/)
+- [Ссылка на раздел официальной документации по созданию сайта для xray](https://xtls.github.io/ru/document/level-0/ch05-webpage.html)
+
+## Клиенты для подключения
+
+**Windows**
+
+- [v2rayN](https://github.com/2dust/v2rayN)  
+- [Furious](https://github.com/LorenEteval/Furious)  
+- [Invisible Man - Xray](https://github.com/InvisibleManVPN/InvisibleMan-XRayClient)  
+
+**Android**
+
+- [v2rayNG](https://github.com/2dust/v2rayNG)  
+- [X-flutter](https://github.com/XTLS/X-flutter)  
+- [SaeedDev94/Xray](https://github.com/SaeedDev94/Xray)  
+
+**iOS & macOS arm64**
+
+- [Streisand](https://apps.apple.com/app/streisand/id6450534064)  
+- [Happ](https://apps.apple.com/app/happ-proxy-utility/id6504287215)  
+- [OneXray](https://github.com/OneXray/OneXray)  
+
+**macOS arm64 & x64**
+
+- [V2rayU](https://github.com/yanue/V2rayU)  
+- [V2RayXS](https://github.com/tzmax/V2RayXS)  
+- [Furious](https://github.com/LorenEteval/Furious)  
+- [OneXray](https://github.com/OneXray/OneXray)  
+
+**Linux**
+
+- [Nekoray](https://github.com/MatsuriDayo/nekoray)  
+- [v2rayA](https://github.com/v2rayA/v2rayA)  
+- [Furious](https://github.com/LorenEteval/Furious)  
+
+## Если вдруг нужно все удалить, то воспользуйтесь этими командами:
+```sh
+bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove
+rm -r /usr/local/etc/xray
+rm /usr/local/bin/userlist
+rm /usr/local/bin/mainuser
+rm /usr/local/bin/newuser
+rm /usr/local/bin/rmuser
+rm /usr/local/bin/sharelink
+```
