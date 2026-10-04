@@ -43,7 +43,7 @@ TLS на 443 терминирует Xray. nginx наружу слушает то
 
 ```bash
 export domain=example.com
-wget -O xray-install.sh <ссылка на скрипт в вашем репозитории>
+wget -O xray-install.sh https://raw.githubusercontent.com/irlichtlabs/xray-with-selfsni/main/xray-install.sh
 bash xray-install.sh
 ```
 
